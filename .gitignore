@@ -1,0 +1,8 @@
+# Local runtime output
+*.log
+*.tmp
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~

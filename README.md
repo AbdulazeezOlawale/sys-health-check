@@ -1,32 +1,40 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/header/graph.svg?title=sys-health-check&subtitle=A+small%2C+reliable+disk+check+for+Linux&logo=linux&mode=dark" />
-    <img alt="sys-health-check" src="https://shieldcn.dev/header/graph.svg?title=sys-health-check&subtitle=A+small%2C+reliable+disk+check+for+Linux&logo=linux&mode=light" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/header/graph.svg?title=sys-health-check&subtitle=Small%2C+readable+health+checks+for+Linux&logo=linux&mode=dark" />
+    <img alt="sys-health-check" src="https://shieldcn.dev/header/graph.svg?title=sys-health-check&subtitle=Small%2C+readable+health+checks+for+Linux&logo=linux&mode=light" />
   </picture>
 </p>
 
 <p align="center">
   <a href="https://www.gnu.org/software/bash/"><img alt="Shell: Bash" src="https://shieldcn.dev/badge/shell-bash.svg?variant=secondary"></a>
   <a href="https://www.kernel.org/"><img alt="Platform: Linux" src="https://shieldcn.dev/badge/platform-linux.svg?variant=secondary"></a>
-  <img alt="Dependencies: none" src="https://shieldcn.dev/badge/dependencies-none.svg?variant=secondary">
+  <img alt="Runtime: systemd" src="https://shieldcn.dev/badge/runtime-systemd.svg?variant=secondary">
   <img alt="Exit codes: 0, 1, 2" src="https://shieldcn.dev/badge/exit%20codes-0%2F1%2F2.svg?variant=secondary">
 </p>
 
-<p align="center"><em>One script. One job. A clear answer about your root filesystem.</em></p>
+<p align="center"><em>Disk, CPU load, and systemd services — one clear status.</em></p>
 
-`sys-health-check` is a small, dependency-free Bash utility that watches the
-root filesystem. It reads disk usage, compares it against two thresholds, prints
-a plain-language message, and exits with a status that other tools can act on.
+`sys-health-check` is a small collection of readable Bash checks for Linux:
 
-| Usage | State | Exit code |
-|---|---|---|
-| Below 80% | OK | `0` |
-| 80% to 89% | WARNING | `1` |
-| 90% or higher | CRITICAL | `2` |
+- `scripts/disk_check.sh` watches root filesystem capacity.
+- `scripts/cpu_service_check.sh` watches one-minute CPU load, failed systemd
+  units, and an optional list of critical services.
 
-I built it while learning Linux system administration. It is intentionally
-small — one script, one job — because the goal was to understand the
-fundamentals properly, not to hide them behind a framework.
+Each check prints a plain-language result and returns the same simple contract:
+`0` for OK, `1` for WARNING, and `2` for CRITICAL. The CPU/service script runs
+all of its checks before choosing the worst status, so one problem never hides
+another.
+
+| Check | Script | Warning (`1`) | Critical (`2`) |
+|---|---|---|---|
+| Root filesystem usage | `disk_check.sh` | 80% or more | 90% or more |
+| One-minute load per core | `cpu_service_check.sh` | 1.5 or more | 3.0 or more |
+| Failed systemd units | `cpu_service_check.sh` | any | — |
+| Critical service inactive | `cpu_service_check.sh` | — | any |
+
+I built these while learning Linux system administration. They are intentionally
+small — a few checks, no framework — because the goal was to understand the
+fundamentals properly.
 
 ## What I learned
 
@@ -57,19 +65,19 @@ right answer.
 
 ### 2. Cutting through noise: small tools, one job each
 
-`df` is written for humans, not parsers. Instead of reading the whole line, I
-let each command do one small job and built the pipeline one stage at a time:
+`df` and `systemctl` are written for humans, not parsers. Instead of reading
+entire lines, I let each command do one small job:
 
 ```bash
-df -P /
-df -P / | awk 'NR==2 {print $5}'
 df -P / | awk 'NR==2 {print $5}' | sed 's/%//'
+systemctl --failed --no-legend | wc -l
 ```
 
 `df -P` gives stable POSIX output, one line per filesystem. `awk` selects the
-second record and its fifth field, and `sed` removes the percent sign. Inspecting
-the output after every stage is the shell equivalent of testing as you go: when
-something looks wrong, you know exactly which step caused it.
+second record and its fifth field, and `sed` removes the percent sign. For the
+service check, `--no-legend` removes the headers and footer, and `wc -l` counts
+what remains. Inspecting the output after each stage is the shell equivalent of
+testing as you go.
 
 I also learned to state my assumptions. `NR==2` assumes root is the second line.
 A more explicit version matches the mount point instead:
@@ -89,9 +97,95 @@ monitoring tools read the number.
 - An explicit `exit` sets the final status; without it, the last command decides.
 
 Here, `1` means warning and `2` means critical. That lets automation escalate
-differently instead of treating every problem as the same emergency. If I had
-returned `1` for everything, the message would still be useful to a human, but
-the tool would be much less useful to a machine.
+differently instead of treating every problem as the same emergency.
+
+### 4. Bash cannot compare floats, so `awk` does it
+
+Bash arithmetic is integer-only. A comparison such as `(( load >= 1.5 ))` fails
+with an invalid arithmetic operator, and `[ "$load" -ge 1.5 ]` reports that an
+integer is expected. Load average is a decimal, so the comparison needs a tool
+that understands floats:
+
+```bash
+if awk "BEGIN {exit !($load_1m >= $crit_thresh)}"; then
+    echo "CRITICAL: CPU load is $load_1m (Threshold $crit_thresh)"
+    cpu_status=2
+fi
+```
+
+`awk` does the decimal math, and `exit` turns the result into a shell status.
+When the comparison is true, `!true` is `0`, which means success to `if`. When
+it is false, the status is `1`.
+
+### 5. `BEGIN` runs once, before any input
+
+`BEGIN` is a special `awk` block that runs once before `awk` reads its first
+input record. That makes it perfect for a pure calculation:
+
+```bash
+warn_thresh=$(awk "BEGIN {print $cores * $WARN_LOAD_PER_CORE}")
+```
+
+There is no file to read and no reason to wait for standard input. `BEGIN` runs
+the block once and finishes. The float comparison uses the same idea; `exit`
+inside `BEGIN` sets the status without needing an input file.
+
+### 6. `nproc` counts CPUs, not processes
+
+I assumed `nproc` returned the number of running processes. It does not: it
+reports the number of processing units available to the process — the CPU cores
+or threads that Linux will schedule work on.
+
+That distinction matters because load average is system-wide. Comparing a raw
+load of `6.0` against a fixed threshold of `1.5` would only make sense on a
+single-core machine. The script scales the thresholds by the number of cores:
+
+```bash
+warn_thresh=$(awk "BEGIN {print $cores * $WARN_LOAD_PER_CORE}")
+```
+
+With four cores, the warning threshold becomes `6.0` and the critical threshold
+becomes `12.0`.
+
+### 7. `--no-legend` keeps the service count clean
+
+```bash
+failed_count=$(systemctl --failed --no-legend | wc -l)
+```
+
+By default, `systemctl` includes a header and footer in its output. Piping that
+straight into `wc -l` would count formatting lines as if they were failed
+services. `--no-legend` removes the legend, leaving one line per failed unit.
+
+The spelling matters: it is `--no-legend`, not `--no-legent`. One extra detail:
+failed units still carry a bullet marker in this mode, which is why the display
+loop uses `$2` for the unit name. Adding `--plain` would remove the bullet and
+make the unit name `$1`.
+
+### 8. Aggregate exit codes: collect first, decide last
+
+A multi-check script should not exit on the first problem. If it does, the reader
+never sees the other results. Each check stores its own status:
+
+```bash
+cpu_status=0
+svc_status=0
+
+# ... run the CPU and service checks ...
+# cpu_status and svc_status are set to 0, 1, or 2
+
+if (( cpu_status == 2 || svc_status == 2 )); then
+    exit 2
+elif (( cpu_status == 1 || svc_status == 1 )); then
+    exit 1
+else
+    exit 0
+fi
+```
+
+The final decision follows severity order: `2` beats `1`, and `1` beats `0`.
+That way the caller gets one meaningful status, but every check still gets a
+chance to report its finding.
 
 ## My choices along the way
 
@@ -115,12 +209,8 @@ Both are valid. I chose the arithmetic form for a few reasons:
 - Comparisons use familiar math operators: `>=`, `>`, `<=`, `==`. The `[ ... ]`
   command uses test operators such as `-ge`, `-gt`, `-le`, and `-eq`, which are
   easy to mix up and can produce confusing errors.
-- `[ ... ]` is a command, so spacing and quoting matter. `(( ... ))` is a shell
-  construct, so numeric variables can be written naturally.
-- The script already requires Bash because of its shebang. There is no
-  portability cost in this context.
-
-The difference is easiest to see side by side:
+- The script already requires Bash because of its shebang, so there is no
+  portability cost here.
 
 | Intent | Arithmetic form | `test` form |
 |---|---|---|
@@ -130,93 +220,111 @@ The difference is easiest to see side by side:
 
 `[[ ... ]]` is not a shortcut around this. Its `<` and `>` operators compare
 strings, so `[[ 9 > 10 ]]` is true in lexicographic order. Numeric comparisons
-still need `-ge` and `-gt`, which is another reason to keep numeric logic inside
-`(( ... ))`.
-
-The trade-off is that `(( ... ))` is not POSIX `sh`. If this needed to run under
-a strictly POSIX shell, I would use `[ "$usage" -ge "$CRIT_THRESHOLD" ]` and
-change the shebang. For this script, Bash is a deliberate choice, so the clearer
-syntax wins.
+still need `-ge` and `-gt`.
 
 ### Other choices
 
+- **`awk` instead of `bc` for floats.** `awk` was already part of the toolset,
+  understands decimals, and can translate its result into an exit status. `bc`
+  would add another dependency and more plumbing.
+- **Per-core thresholds instead of a raw load limit.** A load of `6.0` is busy
+  on one core and relaxed on eight. Scaling by `nproc` makes the check portable
+  across machines.
+- **`--no-legend` before `wc -l`.** Counting formatted output is fragile.
+  Removing the legend first keeps the count tied to real units.
+- **Collect statuses, then exit once.** Early exits are simpler in a one-check
+  script, but they hide information in a multi-check script.
+- **Separate scripts by concern.** Disk, CPU, and services fail in different
+  ways and are easier to read and schedule separately.
+- **An empty `CRITICAL_SERVICES` list by default.** Service names differ between
+  distributions and roles. Add your own to the array at the top of the script
+  instead of letting the script guess.
 - **`df -P /` instead of `df -h`.** Human-readable sizes are nice to read but
   awkward to parse. POSIX output is predictable and keeps one filesystem per
   line.
-- **`awk` plus `sed` instead of one clever one-liner.** Each stage can be tested
-  on its own, which matters more than saving a few characters.
-- **Thresholds as named variables.** `WARN_THRESHOLD` and `CRIT_THRESHOLD` at the
-  top of the file are self-documenting and easy to change.
-- **Distinct exit codes `0`, `1`, and `2`.** The extra code is what separates a
-  warning from an emergency.
-- **Checking `/` only.** This is a deliberately small scope. Extending it to
-  other mount points is a future improvement, not a hidden feature.
-- **Explicit `exit` statements.** The script's job is to report a status, so it
-  says exactly what that status is rather than relying on the last command.
 
 ## Running it
 
 ```bash
-chmod +x scripts/disk_check.sh
+chmod +x scripts/*.sh
 ./scripts/disk_check.sh
-echo $?
+./scripts/cpu_service_check.sh
 ```
 
-Healthy output looks like this:
+Sample output from a healthy host:
 
 ```console
-$ ./scripts/disk_check.sh
-OK: Root filesystem is 66% full.
-$ echo $?
-0
+░▒▓ ❄️   …/sys-health-check   main ?   14:39 
+❯ ./scripts/disk_check.sh
+OK: Root filesystem is 42% full.
+❯ ./scripts/cpu_service_check.sh
+OK: CPU load is 4.32
+OK: No failed systemd services.
 ```
 
-When a threshold is crossed, the message and status change:
-
-```console
-$ ./scripts/disk_check.sh
-WARNING: Root filesystem is 84% full.
-$ echo $?
-1
-```
-
-## Using the exit code in automation
-
-Capture the status before doing anything else:
+To check essential services as well, add their unit names to the array near the
+top of `cpu_service_check.sh`:
 
 ```bash
-./scripts/disk_check.sh
-status=$?
-
-case "${status}" in
-    0) echo "Disk is healthy." ;;
-    1) echo "Disk warning: schedule cleanup." ;;
-    2) echo "Disk critical: investigate now." ;;
-    *) echo "Disk check failed unexpectedly (status ${status})." ;;
-esac
+CRITICAL_SERVICES=(sshd nginx)
 ```
 
-A cron entry that logs output and reports failures to syslog:
+## Test run
 
-```cron
-*/15 * * * * /opt/sys-health-check/scripts/disk_check.sh >> /var/log/disk-check.log 2>&1 || logger -t disk-check "disk check failed with status $?"
+`tests/test_health_checks.sh` runs both checks against temporary copies with
+controlled thresholds and a small fake `systemctl`. The tests do not depend on
+the current CPU load or the state of services on the machine, so the result is
+repeatable.
+
+```console
+░▒▓ ❄️   …/sys-health-check   main ?   14:39 
+❯ ./tests/test_health_checks.sh
+PASS  disk_check.sh: healthy filesystem exits 0
+PASS  disk_check.sh: warning threshold exits 1
+PASS  disk_check.sh: critical threshold exits 2
+PASS  cpu_service_check.sh: healthy CPU and services exits 0
+PASS  cpu_service_check.sh: high load exits 1
+PASS  cpu_service_check.sh: critical load exits 2
+PASS  cpu_service_check.sh: failed unit exits 1
+PASS  cpu_service_check.sh: dead critical service outranks CPU warning
+
+All 8 tests passed.
 ```
 
-For production, prefer a systemd timer or your monitoring agent, and route `1`
-and `2` to different alert severities.
+## Automating both checks
+
+Each script sets `$?`, so a wrapper can run both and keep the worst status:
+
+```bash
+./scripts/disk_check.sh; disk_status=$?
+./scripts/cpu_service_check.sh; cpu_status=$?
+
+status=$(( disk_status > cpu_status ? disk_status : cpu_status ))
+echo "Overall status: ${status}"
+exit "${status}"
+```
+
+The same pattern works in cron, a systemd timer, or a monitoring agent. Route
+`1` and `2` to different alert severities when your tooling supports it.
 
 ## Requirements and layout
 
-Linux, Bash 4 or newer, and the standard `df`, `awk`, and `sed` tools.
+- Linux, with systemd available for `cpu_service_check.sh`
+- Bash 4 or newer
+- Standard tools: `df`, `awk`, `sed`, `nproc`, and `wc`
+- `/proc/loadavg` for the one-minute load average
 
 ```text
 sys-health-check/
 ├── README.md
-└── scripts/
-    └── disk_check.sh
+├── scripts/
+│   ├── cpu_service_check.sh
+│   └── disk_check.sh
+└── tests/
+    └── test_health_checks.sh
 ```
 
-The script checks capacity, not inode exhaustion, and it does not replace a
-full monitoring agent. It is a small early warning that is easy to read, easy to
-trust, and easy to extend.
-# sys-health-check
+`disk_check.sh` checks capacity, not inode exhaustion. `cpu_service_check.sh`
+checks load and selected services, not every process on the host. Neither script
+replaces a full monitoring agent; they are small early warnings that are easy to
+read and easy to extend.
